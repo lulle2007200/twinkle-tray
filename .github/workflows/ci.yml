@@ -9,6 +9,7 @@ jobs:
     strategy:
       matrix:
         node-version: [16.x]
+        os: [windows-latest]
 
     steps:
       - uses: actions/checkout@v3
