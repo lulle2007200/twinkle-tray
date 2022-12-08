@@ -17,11 +17,7 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Set Windows environment
-        if: startsWith(matrix.os, 'windows')
-        run: |
-          echo 'GYP_MSVS_VERSION=2015' >> $Env:GITHUB_ENV
-          echo 'GYP_MSVS_OVERRIDE_PATH=C:\\Dummy' >> $Env:GITHUB_ENV
+      - run: npm install --g --production windows-build-tools
       - run: npm install
       - run: npm run build --if-present
         env:
