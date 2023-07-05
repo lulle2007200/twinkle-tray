@@ -45,6 +45,9 @@ const setWindowPos = () => {}
 const AccentColors = require("windows-accent-colors")
 const Acrylic = require("acrylic")
 
+const ActiveWindow = require('@paymoapp/active-window').default;
+ActiveWindow.initialize(10)
+
 const reg = require('native-reg');
 const Color = require('color')
 const Translate = require('./Translate');
@@ -265,18 +268,31 @@ function willPauseMouseEvents(time = 10000) {
 
 // Analytics
 let analyticsInterval = false
-let analyticsFrequency = 1000 * 60 * 59 // 59 minutes
+let analyticsFrequency = 1000 * 60 * 29 // 29 minutes
+let lastAnalyticsPing = 0
 
 function pingAnalytics() {
-  const analytics = require('universal-analytics')('UA-146439005-2', settings.uuid)
+  // Skip if too recent
+  if(Date.now() < lastAnalyticsPing + (1000*60*28)) return false;
+  
+  const analytics = require('ga4-mp').createClient("Y1YTliQdTL-moveI0z1TLA", "G-BQ22ZK4BPY", settings.uuid)
   console.log("\x1b[34mAnalytics:\x1b[0m sending with UUID " + settings.uuid)
-  analytics.set("ds", "app")
-  analytics.pageview(app.name + "/" + "v" + app.getVersion()).send()
-  analytics.event({
-    ec: "Session Information",
-    ea: "OS Version",
-    el: require("os").release()
-  }).send()
+
+  let events = []
+  events.push({
+    name: "page_view",
+    params: {
+      page_location: app.name + "/" + "v" + app.getVersion(),
+      page_title: app.name + "/" + "v" + app.getVersion(),
+      page_referrer: app.name,
+      os_version: require("os").release(),
+      app_type: app.name,
+      app_version: app.getVersion(),
+      engagement_time_msec: 1
+    }
+  })
+  analytics.send(events)
+  lastAnalyticsPing = Date.now()
 }
 
 let monitors = {}
@@ -361,6 +377,7 @@ const defaultSettings = {
   ddcPowerOffValue: 6,
   disableAutoRefresh: false,
   disableAutoApply: false,
+  profiles: [],
   uuid: uuid(),
   branch: "master"
 }
@@ -434,7 +451,7 @@ if(settings.forceLowPowerGPU) {
 }
 
 let writeSettingsTimeout = false
-function writeSettings(newSettings = {}, processAfter = true) {
+function writeSettings(newSettings = {}, processAfter = true, sendUpdate = true) {
   settings = Object.assign(settings, newSettings)
 
   if (!writeSettingsTimeout) {
@@ -449,11 +466,11 @@ function writeSettings(newSettings = {}, processAfter = true) {
     }, 333)
   }
 
-  if (processAfter) processSettings(newSettings);
+  if (processAfter) processSettings(newSettings, sendUpdate);
 }
 
 
-function processSettings(newSettings = {}) {
+function processSettings(newSettings = {}, sendUpdate = true) {
 
   let doRestartPanel = false
   let rebuildTray = false
@@ -575,7 +592,7 @@ function processSettings(newSettings = {}) {
     ddcBrightnessVCPs: getDDCBrightnessVCPs()
   })
 
-  sendToAllWindows('settings-updated', settings)
+  if(sendUpdate) sendToAllWindows('settings-updated', settings);
 }
 
 // Save all known displays to disk for future use
@@ -782,7 +799,7 @@ const doHotkey = async (hotkey) => {
 }
 
 function hotkeyOverlayStart(timeout = 3000, force = true) {
-  if(settings.disableOverlay) return false;
+  if(settings.disableOverlay || currentProfile?.overlayType === "disabled") return false;
   if (canReposition) {
     hotkeyOverlayShow()
   }
@@ -1083,9 +1100,9 @@ function sendToAllWindows(eventName, data) {
   }
 }
 
-ipcMain.on('send-settings', (event, newSettings) => {
-  console.log("Recieved new settings", newSettings)
-  writeSettings(newSettings)
+ipcMain.on('send-settings', (event, data) => {
+  console.log("Recieved new settings", data.newSettings)
+  writeSettings(data.newSettings, true, data.sendUpdate)
 })
 
 ipcMain.on('request-settings', (event) => {
@@ -1419,6 +1436,10 @@ function updateBrightness(index, level, useCap = true, vcp = "brightness", clear
       console.log(`Monitor does not exist: ${index}`)
       return false
     }
+
+    if(settings.hideDisplays?.[monitor.key] === true) {
+      return false
+    }
     
     if(clearTransition && currentTransition) {
       clearInterval(currentTransition)
@@ -1737,6 +1758,8 @@ ipcMain.on('set-vcp', (e, values) => {
   updateBrightnessThrottle(values.monitor, values.value, false, true, values.code)
 })
 
+ipcMain.on('get-window-history', () => sendToAllWindows('window-history', windowHistory))
+
 
 //
 //
@@ -1867,7 +1890,7 @@ function createPanel(toggleOnLoad = false) {
 function setAlwaysOnTop(onTop = true) {
   if(!mainWindow) return false;
   if(onTop) {
-    mainWindow.setAlwaysOnTop(true, 'modal-panel')
+    mainWindow.setAlwaysOnTop(true, (currentProfile?.overlayType === "disabled" ? 'screen-saver' : 'modal-panel'))
   } else {
     mainWindow.setAlwaysOnTop(false)
   }
@@ -2017,6 +2040,99 @@ function repositionPanel() {
 
 
 
+let forcedFocusID = 0
+let currentProfile
+const ignoreAppList = [
+  "twinkletray.exe",
+  "explorer.exe",
+  "electron.exe"
+]
+const windowHistory = []
+let preProfileBrightness = {}
+function startFocusTracking() {
+  ActiveWindow.subscribe( async window => {
+    const hwnd = WindowUtils.getForegroundWindow()
+    const profile = windowMatchesProfile(window)
+
+    if(ignoreAppList.includes(path.basename(window.path)) === false) {
+      // Remove from history if exists
+      const isInHistory = windowHistory.find( (w, idx) => {
+        if(w.path === window.path) {
+          windowHistory.splice(idx, 1)
+          return true
+        }
+        return false
+      })
+
+      // Add current window
+      windowHistory.unshift({
+        app: window.application,
+        path: window.path
+      }) 
+
+      // Limit history
+      while(windowHistory.length > 10) windowHistory.pop();
+      sendToAllWindows('window-history', windowHistory)
+    }
+
+    if(forcedFocusID > 0 && forcedFocusID !== hwnd && hwnd != getMainWindowHandle()) {
+      // This is the overlay
+      // We're going to force focus back to the previous window
+      trySetForegroundWindow(hwnd)
+    } else if(profile?.setBrightness) {
+      // Set brightness, if available
+    
+      // First, save current brightness for later
+      await updateKnownDisplays(true, true)
+      preProfileBrightness = Object.assign({}, lastKnownDisplays)
+
+      // Then apply user profile brightness
+      applyProfileBrightness(profile)
+    } else if(currentProfile?.setBrightness) {
+      // Last profile had brightness settings
+      // So we should restore the last known brightness
+      applyProfile(preProfileBrightness, false)
+    }
+    currentProfile = profile
+  })
+}
+
+function windowMatchesProfile(window) {
+  let foundProfile
+  if(settings.profiles?.length > 0) {
+    for(const profile of settings.profiles) {
+      if(window.path?.length > 0 && window.path.toLowerCase().indexOf(profile.path?.toLowerCase()) > -1) {
+        foundProfile = profile
+      }
+    }
+  }
+  return foundProfile
+}
+
+function applyProfileBrightness(profile) {
+  try {
+    Object.values(monitors)?.forEach(monitor => {
+      updateBrightness(monitor.id, profile.monitors[monitor.id], true, monitor.brightnessType)
+    })
+  } catch(e) {
+    console.log("Error applying profile brightness", e)
+  }
+}
+
+function getMainWindowHandle() {
+  try {
+    return mainWindow.getNativeWindowHandle().readInt32LE()
+  } catch(e) {
+    return 0
+  }
+}
+
+
+
+
+
+
+
 /*
 
 
@@ -2112,49 +2228,23 @@ function showPanel(show = true, height = 300) {
 }
 
 function trySetForegroundWindow(hwnd) {
+  if(!hwnd) return false;
   try {
     console.log("trySetForegroundWindow: " + hwnd)
     WindowUtils.setForegroundWindow(hwnd)
   } catch(e) {
-    console.log("Couldn't focus window after minimize!", e)
+    console.log("Couldn't focus window", e)
   }
 }
 
 let startHideTimeout
-let lastActiveWindow = 0
 function startHidePanel() {
-  const mainWindowHWND = mainWindow.getNativeWindowHandle().readInt32LE()
   if(!startHideTimeout) {
     startHideTimeout = setTimeout(() => {
-      lastActiveWindow = 0
       if(mainWindow) {
-        try {
-          lastActiveWindow = WindowUtils.getForegroundWindow()
-          console.log("getForegroundWindow: " + lastActiveWindow)
-        } catch(e) { 
-          console.log("Couldn't get foreground window!", e)
-        }
         mainWindow.minimize();
       }
-      startHideTimeout = null
-      setTimeout(() => {
-        try { global.gc() } catch(e) {}
-      }, 1000)
-
-      // Kill me
-      if(lastActiveWindow && lastActiveWindow != mainWindowHWND) {
-        trySetForegroundWindow(lastActiveWindow);
-        setTimeout(() => {
-          trySetForegroundWindow(lastActiveWindow);
-        }, 33)
-        setTimeout(() => {
-          trySetForegroundWindow(lastActiveWindow);
-        }, 50)
-        setTimeout(() => {
-          trySetForegroundWindow(lastActiveWindow);
-        }, 100)
-      }
-      
+      startHideTimeout = null      
     }, 100)
 
     if(mainWindow) mainWindow.setOpacity(0);
@@ -2335,16 +2425,6 @@ function createTray() {
     }
   })
 
-  nativeTheme.on('updated', async () => {
-    console.log("Event: theme updated");
-    await getThemeRegistry()
-    try {
-      tray.setImage(getTrayIconPath())
-    } catch (e) {
-      debug.log("Couldn't update tray icon!", e)
-    }
-  })
-
 }
 
 function setTrayMenu() {
@@ -2394,7 +2474,7 @@ function getDebugTrayMenuItems() {
     { label: "DO CURRENT TOD", type: 'normal', click: () => applyCurrentAdjustmentEvent(true) },
     { label: "REMOVE ACRYLIC", type: 'normal', click: () => tryVibrancy(mainWindow, false) },
     { label: "PAUSE MOUSE", type: 'normal', click: () => pauseMouseEvents(true) },
-    { label: "LAST ACTIVE WIN", type: 'normal', click: () => trySetForegroundWindow(lastActiveWindow) }
+    { label: "LAST ACTIVE WIN", type: 'normal', click: () => trySetForegroundWindow(forcedFocusID) }
   ] }
 }
 
@@ -2853,6 +2933,7 @@ let backgroundInterval = null
 function addEventListeners() {
   systemPreferences.on('accent-color-changed', handleAccentChange)
   systemPreferences.on('color-changed', handleAccentChange)
+  nativeTheme.on('updated', handleAccentChange)
 
   addDisplayChangeListener(handleMonitorChange)
 
@@ -2861,13 +2942,24 @@ function addEventListeners() {
   // Disable mouse events at startup
   pauseMouseEvents(true)
 
+  startFocusTracking()
 }
 
+let handleAccentChangeTimeout = false
 function handleAccentChange() {
-  console.log("Event: handleAccentChange");
-  sendToAllWindows('update-colors', getAccentColors())
-  getThemeRegistry()
-  sendMicaWallpaper()
+  if(handleAccentChangeTimeout) clearTimeout(handleAccentChangeTimeout);
+  handleAccentChangeTimeout = setTimeout(async () => {
+    console.log("Event: handleAccentChange");
+    sendToAllWindows('update-colors', getAccentColors())
+    await getThemeRegistry()
+    setTimeout(sendMicaWallpaper, 100)
+    try {
+      tray.setImage(getTrayIconPath())
+    } catch (e) {
+      debug.log("Couldn't update tray icon!", e)
+    }
+    handleAccentChangeTimeout = false
+  }, 2000)
 }
 
 let skipFirstMonChange = false
@@ -3039,7 +3131,7 @@ function idleCheckShort() {
       }
     }
   
-    if(isUserIdle && idleTime < lastIdleTime) {
+    if(isUserIdle && (idleTime < lastIdleTime || idleTime < getIdleSettingValue())) {
       // Wake up
       console.log(`\x1b[36mUser no longer idle after ${lastIdleTime} seconds.\x1b[0m`)
       clearInterval(notIdleMonitor)
@@ -3183,7 +3275,7 @@ function getCurrentAdjustmentEventLERP() {
 // If applicable, apply the current Time of Day Adjustment
 function applyCurrentAdjustmentEvent(force = false, instant = true) {
   try {
-    if (tempSettings.pauseTimeAdjustments) return false;
+    if (tempSettings.pauseTimeAdjustments || currentProfile?.setBrightness) return false;
     if (settings.adjustmentTimes.length === 0 || userIdleDimmed) return false;
 
     const date = new Date()
@@ -3293,6 +3385,10 @@ Example: --VCP="0xD6:5"
 Flag to show brightness levels in the overlay
 Example: --Overlay
 
+--Panel
+Flag to show brightness levels in the panel
+Example: --Panel
+
 */
 function handleCommandLine(event, argv, directory, additionalData) {
 
@@ -3374,6 +3470,11 @@ function handleCommandLine(event, argv, directory, additionalData) {
           hotkeyOverlayStart()
         }
 
+        // Show panel
+        if (arg.indexOf("--panel") === 0 && panelState !== "visible") {
+          toggleTray(true)
+        }
+
       })
 
       // If value input, update brightness
@@ -3428,37 +3529,42 @@ function handleCommandLine(event, argv, directory, additionalData) {
 // Mica features
 let currentWallpaper = "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs%3D";
 let currentWallpaperTime = false;
+let currentWallpaperFileSize = 0;
 let currentScreenSize = {width: 1280, height: 720}
 let sharpBusy = false
+let lastSharpTime = Date.now()
 const homeDir = require("os").homedir()
-const micaWallpaperPath = path.join(configFilesDir, `\\mica${(isDev ? "-dev" : "")}.webp`)
+const micaWallpaperPath = path.join(configFilesDir, `\\mica${(isDev ? "-dev" : "")}.jpg`)
 async function getWallpaper() {
-  if(sharpBusy) return false;
+  if(sharpBusy) return { path: currentWallpaper, size: currentScreenSize };
   try {  
     const wallPath = path.join(homeDir, "AppData", "Roaming", "Microsoft", "Windows", "Themes", "TranscodedWallpaper");
     const file = fs.statSync(wallPath)
+    const newTime = file.mtime.getTime()
+    const newSize = file.size
 
     // If time on file changed, render new wallpaper
-    if(file?.mtime && file.mtime.getTime() !== currentWallpaperTime) {
+    if(file?.mtime && (newTime !== currentWallpaperTime || newSize !== currentWallpaperFileSize)) {
       sharpBusy = true
       currentScreenSize = screen.getPrimaryDisplay().workAreaSize
       const sharp = require('sharp')
-      currentWallpaper = "file://" + wallPath + "?" + Date.now()
+      sharp.cache(false)
       const wallpaperImage = sharp(wallPath)
-      //const wallpaperInfo = await wallpaperImage.metadata()
-      const image = await sharp({
+      await sharp({
         create: {
-          width: currentScreenSize.width,
-          height: currentScreenSize.height,
+          width: currentScreenSize.width * 0.5,
+          height: currentScreenSize.height * 0.5,
           channels: 4,
           background: "#202020FF"
         }
-      }).composite([{ input: await wallpaperImage.ensureAlpha(1).resize(currentScreenSize.width, currentScreenSize.height, { fit: "fill" }).blur(80).toBuffer(), blend: "source" }]).flatten().webp({ quality: 95, nearLossless: true, reductionEffort: 0 }).toFile(micaWallpaperPath)
+      }).composite([{ input: await wallpaperImage.ensureAlpha(1).resize(currentScreenSize.width * 0.5, currentScreenSize.height * 0.5, { fit: "fill" }).blur(30).toBuffer(), blend: "source" }]).flatten().jpeg({ quality: 95 }).toFile(micaWallpaperPath)
       currentWallpaper = "file://" + micaWallpaperPath + "?" + Date.now()
-      currentWallpaperTime = file.mtime.getTime()
-      Utils.unloadModule("sharp")
+      currentWallpaperTime = newTime
+      currentWallpaperFileSize = newSize;
+      lastSharpTime = Date.now()
     }
     
+    Utils.unloadModule("sharp")
     sharpBusy = false
     return { path: currentWallpaper, size: currentScreenSize }
   } catch(e) {
@@ -3469,7 +3575,7 @@ async function getWallpaper() {
 }
 
 async function sendMicaWallpaper() {
-  // Skip if Win10
-  if(!settings?.isWin11 || !mainWindow) return false;
+  // Skip if Win10 or Mica disabled
+  if(!settings?.useAcrylic || !settings?.isWin11 || !mainWindow) return false;
   sendToAllWindows("mica-wallpaper", await getWallpaper())
 }
